@@ -1,0 +1,92 @@
+#!/usr/bin/env bash
+# Manage the cursor-barrier game list in hyprland autostart.conf
+
+AUTOSTART="$HOME/.config/hypr/autostart.conf"
+
+_get_games() {
+    local raw
+    raw=$(grep -oP '(?<=cursor-barrier ).*' "$AUTOSTART")
+    eval "args=($raw)"
+    printf '%s\n' "${args[@]}"
+}
+
+_write_games() {
+    local games=()
+    while IFS= read -r game; do
+        games+=("$game")
+    done
+    python3 - "$AUTOSTART" "${games[@]}" <<'EOF'
+import sys, re
+conf, *games = sys.argv[1:]
+quoted = " ".join(f'"{g}"' for g in games)
+new_line = f"exec-once = cursor-barrier {quoted}"
+with open(conf) as f:
+    content = f.read()
+content = re.sub(r'exec-once = cursor-barrier .*', new_line, content)
+with open(conf, 'w') as f:
+    f.write(content)
+EOF
+}
+
+_restart() {
+    pkill -f cursor-barrier 2>/dev/null || true
+    sleep 0.2
+    local line
+    line=$(grep 'cursor-barrier' "$AUTOSTART" | sed 's/exec-once = //')
+    setsid bash -c "$line" &>/dev/null & disown
+}
+
+cmd="${1:-list}"
+shift 2>/dev/null || true
+
+case "$cmd" in
+    list|ls)
+        echo "cursor-barrier games:"
+        _get_games | while IFS= read -r g; do echo "  - $g"; done
+        ;;
+    add)
+        [[ -z "$*" ]] && { echo "Usage: cbgames add <game> [game...]"; exit 1; }
+        mapfile -t current < <(_get_games)
+        for game in "$@"; do
+            for existing in "${current[@]}"; do
+                [[ "${existing,,}" == "${game,,}" ]] && { echo "Already listed: $existing"; continue 2; }
+            done
+            current+=("$game")
+            echo "Added: $game"
+        done
+        printf '%s\n' "${current[@]}" | _write_games
+        _restart
+        echo "Restarted cursor-barrier."
+        ;;
+    remove|rm|del)
+        [[ -z "$*" ]] && { echo "Usage: cbgames remove <game> [game...]"; exit 1; }
+        mapfile -t current < <(_get_games)
+        new=()
+        for existing in "${current[@]}"; do
+            keep=true
+            for target in "$@"; do
+                [[ "${existing,,}" == "${target,,}" ]] && { echo "Removed: $existing"; keep=false; break; }
+            done
+            $keep && new+=("$existing")
+        done
+        if [[ ${#new[@]} -eq 0 ]]; then
+            echo "Error: cannot remove all games (list would be empty)" >&2
+            exit 1
+        fi
+        printf '%s\n' "${new[@]}" | _write_games
+        _restart
+        echo "Restarted cursor-barrier."
+        ;;
+    restart)
+        _restart
+        echo "Restarted cursor-barrier."
+        ;;
+    *)
+        echo "Usage: cbgames <list|add|remove|restart> [args...]"
+        echo "  list              Show current games"
+        echo "  add <game...>     Add game(s) and restart"
+        echo "  remove <game...>  Remove game(s) and restart"
+        echo "  restart           Restart cursor-barrier with current list"
+        exit 1
+        ;;
+esac

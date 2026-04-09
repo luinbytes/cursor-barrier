@@ -1,0 +1,7 @@
+[Desktop Entry]
+Name=Cursor Barrier
+Comment=Manage cursor barrier games
+Exec=cursor-barrier-gui
+Icon=input-mouse-symbolic
+Type=Application
+Categories=Settings;

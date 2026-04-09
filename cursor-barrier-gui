@@ -1,0 +1,285 @@
+#!/usr/bin/env python3
+import gi, re, subprocess, sys, os, socket, threading
+gi.require_version("Gtk", "4.0")
+gi.require_version("Adw", "1")
+from gi.repository import Gtk, Adw, GLib
+
+AUTOSTART = os.path.expanduser("~/.config/hypr/autostart.conf")
+
+
+def get_games():
+    with open(AUTOSTART) as f:
+        content = f.read()
+    m = re.search(r'exec-once = cursor-barrier (.*)', content)
+    if not m:
+        return []
+    import shlex
+    return shlex.split(m.group(1))
+
+
+def write_games(games):
+    quoted = " ".join(f'"{g}"' for g in games)
+    new_line = f'exec-once = cursor-barrier {quoted}'
+    with open(AUTOSTART) as f:
+        content = f.read()
+    content = re.sub(r'exec-once = cursor-barrier .*', new_line, content)
+    with open(AUTOSTART, 'w') as f:
+        f.write(content)
+
+
+def restart_barrier(games):
+    subprocess.run(["pkill", "-f", "cursor-barrier"], capture_output=True)
+    GLib.timeout_add(200, lambda: subprocess.Popen(
+        ["cursor-barrier"] + games,
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        start_new_session=True
+    ) and False)
+
+
+def hypr_socket2_path():
+    sig = os.environ.get("HYPRLAND_INSTANCE_SIGNATURE", "")
+    runtime = os.environ.get("XDG_RUNTIME_DIR", "/run/user/1000")
+    if not sig:
+        return None
+    return f"{runtime}/hypr/{sig}/.socket2.sock"
+
+
+def pick_window_class(cancel_event, callback):
+    """Subscribe to Hyprland events, skip events until the app window loses focus,
+    then return the class of the next window the user focuses."""
+    def run():
+        path = hypr_socket2_path()
+        if not path or not os.path.exists(path):
+            GLib.idle_add(callback, None, "Hyprland socket not found.")
+            return
+
+        try:
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            sock.connect(path)
+            sock.settimeout(1.0)
+        except OSError as e:
+            GLib.idle_add(callback, None, f"Socket error: {e}")
+            return
+
+        buf = ""
+        # Wait until we see the app lose focus (activewindow fires for something else),
+        # but give a short grace period for the hide animation first.
+        grace_done = False
+        grace_timer = threading.Timer(0.4, lambda: None)
+        grace_timer.start()
+
+        try:
+            while not cancel_event.is_set():
+                try:
+                    data = sock.recv(4096).decode("utf-8", errors="replace")
+                except socket.timeout:
+                    # Check 30s total timeout via cancel_event having a deadline
+                    continue
+                if not data:
+                    break
+                buf += data
+                while "\n" in buf:
+                    line, buf = buf.split("\n", 1)
+                    if not line.startswith("activewindow>>"):
+                        continue
+                    if not grace_timer.finished.is_set():
+                        # Still in grace period, skip
+                        continue
+                    payload = line[len("activewindow>>"):]
+                    cls = payload.split(",")[0].strip()
+                    if not cls:
+                        continue
+                    # Skip if it looks like our own app
+                    if cls.lower() in ("cursor-barrier-gui", "python3", "python"):
+                        continue
+                    sock.close()
+                    GLib.idle_add(callback, cls, None)
+                    return
+        finally:
+            grace_timer.cancel()
+            try:
+                sock.close()
+            except Exception:
+                pass
+
+        if cancel_event.is_set():
+            GLib.idle_add(callback, None, "cancelled")
+        else:
+            GLib.idle_add(callback, None, "Timed out — no window selected.")
+
+    t = threading.Thread(target=run, daemon=True)
+    t.start()
+
+
+class CursorBarrierApp(Adw.Application):
+    def __init__(self):
+        super().__init__(application_id="lu.cursorbarrier")
+        self.connect("activate", self.on_activate)
+        self._pick_cancel = None
+
+    def on_activate(self, app):
+        win = Adw.ApplicationWindow(application=app, title="Cursor Barrier", default_width=360, default_height=480)
+
+        toolbar_view = Adw.ToolbarView()
+        header = Adw.HeaderBar()
+        toolbar_view.add_top_bar(header)
+
+        add_btn = Gtk.Button(icon_name="list-add-symbolic", tooltip_text="Add game")
+        add_btn.connect("clicked", self.on_add_clicked, win)
+        header.pack_end(add_btn)
+
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        box.set_margin_top(12)
+        box.set_margin_bottom(12)
+        box.set_margin_start(12)
+        box.set_margin_end(12)
+
+        self.list_box = Gtk.ListBox()
+        self.list_box.set_selection_mode(Gtk.SelectionMode.NONE)
+        self.list_box.add_css_class("boxed-list")
+
+        scroll = Gtk.ScrolledWindow(vexpand=True)
+        scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        scroll.set_child(self.list_box)
+        box.append(scroll)
+
+        self.status_label = Gtk.Label(label="")
+        self.status_label.set_margin_top(8)
+        self.status_label.add_css_class("caption")
+        self.status_label.add_css_class("dim-label")
+        box.append(self.status_label)
+
+        toolbar_view.set_content(box)
+        win.set_content(toolbar_view)
+
+        self.win = win
+        self.refresh_list()
+        win.present()
+
+    def refresh_list(self):
+        while child := self.list_box.get_first_child():
+            self.list_box.remove(child)
+
+        games = get_games()
+        if not games:
+            row = Adw.ActionRow(title="No games configured")
+            row.add_css_class("dim-label")
+            self.list_box.append(row)
+        else:
+            for game in games:
+                row = Adw.ActionRow(title=game)
+                del_btn = Gtk.Button(icon_name="list-remove-symbolic", tooltip_text="Remove", valign=Gtk.Align.CENTER)
+                del_btn.add_css_class("flat")
+                del_btn.add_css_class("destructive-action")
+                del_btn.connect("clicked", self.on_remove_clicked, game)
+                row.add_suffix(del_btn)
+                self.list_box.append(row)
+
+    def on_remove_clicked(self, btn, game):
+        games = get_games()
+        games = [g for g in games if g.lower() != game.lower()]
+        write_games(games)
+        restart_barrier(games)
+        self.refresh_list()
+        self.flash_status(f'Removed "{game}" and restarted.')
+
+    def on_add_clicked(self, btn, win):
+        self._active_dialog = None
+
+        dialog = Adw.AlertDialog(
+            heading="Add Game",
+            body="Enter the window class name, or use the picker to click a window.",
+        )
+        dialog.add_response("cancel", "Cancel")
+        dialog.add_response("add", "Add")
+        dialog.set_response_appearance("add", Adw.ResponseAppearance.SUGGESTED)
+        dialog.set_default_response("add")
+        dialog.set_close_response("cancel")
+
+        entry_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        entry_box.set_margin_top(12)
+
+        self._pick_entry = Gtk.Entry(placeholder_text="e.g. halfsword", activates_default=True, hexpand=True)
+
+        self._pick_btn = Gtk.Button(icon_name="color-select-symbolic", tooltip_text="Click a window to detect its class")
+        self._pick_btn.add_css_class("flat")
+        self._pick_btn.connect("clicked", self.on_pick_clicked, dialog)
+
+        entry_box.append(self._pick_entry)
+        entry_box.append(self._pick_btn)
+        dialog.set_extra_child(entry_box)
+
+        dialog.connect("response", self.on_add_response, self._pick_entry)
+        # Cancel the picker if dialog is dismissed any way
+        dialog.connect("response", lambda d, r, *a: self._cancel_pick())
+        self._active_dialog = dialog
+        dialog.present(win)
+
+    def on_pick_clicked(self, btn, dialog):
+        # Cancel any previous pick
+        self._cancel_pick()
+
+        self._pick_cancel = threading.Event()
+        btn.set_sensitive(False)
+        btn.set_icon_name("content-loading-symbolic")
+        self.flash_status("Click any window to detect its class...")
+
+        # Hide our window so it doesn't show up as the picked window
+        self.win.set_visible(False)
+
+        # Set a 30s hard timeout via cancel event
+        def timeout():
+            if self._pick_cancel and not self._pick_cancel.is_set():
+                self._pick_cancel.set()
+        threading.Timer(30, timeout).start()
+
+        cancel_event = self._pick_cancel
+
+        def on_picked(cls, err):
+            # Restore window first
+            self.win.set_visible(True)
+            self.win.present()
+
+            btn.set_sensitive(True)
+            btn.set_icon_name("color-select-symbolic")
+
+            if err == "cancelled":
+                return
+            if err:
+                self.flash_status(err)
+                return
+            if cls:
+                self._pick_entry.set_text(cls)
+                self._pick_entry.grab_focus()
+                self.flash_status(f'Detected: "{cls}"')
+
+        pick_window_class(cancel_event, on_picked)
+
+    def _cancel_pick(self):
+        if self._pick_cancel:
+            self._pick_cancel.set()
+            self._pick_cancel = None
+
+    def on_add_response(self, dialog, response, entry):
+        if response != "add":
+            return
+        name = entry.get_text().strip()
+        if not name:
+            return
+        games = get_games()
+        if any(g.lower() == name.lower() for g in games):
+            self.flash_status(f'"{name}" is already in the list.')
+            return
+        games.append(name)
+        write_games(games)
+        restart_barrier(games)
+        self.refresh_list()
+        self.flash_status(f'Added "{name}" and restarted.')
+
+    def flash_status(self, msg):
+        self.status_label.set_text(msg)
+        GLib.timeout_add_seconds(4, lambda: self.status_label.set_text("") or False)
+
+
+app = CursorBarrierApp()
+sys.exit(app.run(sys.argv))
