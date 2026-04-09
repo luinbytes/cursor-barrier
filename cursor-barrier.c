@@ -13,7 +13,7 @@
  * preventing games from losing button-release events across device IDs.
  *
  * Usage:
- *   cursor-barrier [OPTIONS] PATTERN
+ *   cursor-barrier [OPTIONS] PATTERN [PATTERN...]
  *
  * Options:
  *   -m, --monitor NAME    Confine to this monitor (e.g. DP-1). Auto-detected
@@ -24,6 +24,7 @@
  *
  * Examples:
  *   cursor-barrier "war thunder"
+ *   cursor-barrier "war thunder" "call of duty"
  *   cursor-barrier --monitor DP-1 "war thunder"
  *   cursor-barrier --monitor HDMI-A-1 --buffer 400 "minecraft"
  *   cursor-barrier --boundary 2560 "game.exe"
@@ -47,6 +48,7 @@
 #include <libevdev/libevdev-uinput.h>
 
 #define MAX_MICE         16
+#define MAX_PATTERNS     16
 #define DEFAULT_BUFFER   300
 #define GRAB_EXIT_EXTRA  200   /* hysteresis: ungrab this many px past grab threshold */
 
@@ -259,12 +261,25 @@ static int contains_lower(const char *haystack, const char *needle) {
     return 0;
 }
 
+/*
+ * Returns the index of the first pattern in pats[0..npatterns) that matches
+ * haystack, or -1 if none match.
+ */
+static int match_pattern_idx(const char *haystack,
+                              const char pats[][256], int npatterns) {
+    for (int i = 0; i < npatterns; i++) {
+        if (contains_lower(haystack, pats[i]))
+            return i;
+    }
+    return -1;
+}
+
 static void usage(const char *prog) {
     fprintf(stderr,
-        "Usage: %s [OPTIONS] PATTERN\n"
+        "Usage: %s [OPTIONS] PATTERN [PATTERN...]\n"
         "\n"
-        "Confine the cursor to a monitor while a window matching PATTERN is focused.\n"
-        "PATTERN is matched case-insensitively against the window class name.\n"
+        "Confine the cursor to a monitor while a window matching any PATTERN is focused.\n"
+        "PATTERNs are matched case-insensitively against the window class name.\n"
         "\n"
         "Options:\n"
         "  -m, --monitor NAME    Monitor to confine to (e.g. DP-1, HDMI-A-1).\n"
@@ -277,18 +292,19 @@ static void usage(const char *prog) {
         "\n"
         "Examples:\n"
         "  %s \"war thunder\"\n"
+        "  %s \"war thunder\" \"call of duty\"\n"
         "  %s --monitor DP-1 \"war thunder\"\n"
         "  %s --monitor HDMI-A-1 --buffer 400 \"minecraft\"\n"
         "  %s --boundary 2560 \"game.exe\"\n",
-        prog, DEFAULT_BUFFER, prog, prog, prog, prog);
+        prog, DEFAULT_BUFFER, prog, prog, prog, prog, prog);
 }
 
 /* ── Main ── */
 
 int main(int argc, char **argv) {
-    const char *pattern      = NULL;
     const char *monitor_name = NULL;
     int boundary_x           = -1;   /* -1 = not set, auto-detect */
+    int boundary_explicit    = 0;    /* set when --monitor or --boundary given */
     int buffer               = DEFAULT_BUFFER;
 
     static struct option opts[] = {
@@ -302,8 +318,8 @@ int main(int argc, char **argv) {
     int c;
     while ((c = getopt_long(argc, argv, "m:x:b:h", opts, NULL)) != -1) {
         switch (c) {
-            case 'm': monitor_name = optarg;        break;
-            case 'x': boundary_x   = atoi(optarg); break;
+            case 'm': monitor_name = optarg;        boundary_explicit = 1; break;
+            case 'x': boundary_x   = atoi(optarg); boundary_explicit = 1; break;
             case 'b': buffer       = atoi(optarg); break;
             case 'h': usage(argv[0]); return 0;
             default:  usage(argv[0]); return 1;
@@ -311,16 +327,25 @@ int main(int argc, char **argv) {
     }
 
     if (optind >= argc) {
-        fprintf(stderr, "cursor-barrier: PATTERN is required\n\n");
+        fprintf(stderr, "cursor-barrier: at least one PATTERN is required\n\n");
         usage(argv[0]);
         return 1;
     }
-    pattern = argv[optind];
 
-    /* Lowercase pattern for matching */
-    char pat[256] = {0};
-    for (size_t i = 0; i < strlen(pattern) && i < sizeof(pat) - 1; i++)
-        pat[i] = tolower(pattern[i]);
+    /* Collect all remaining arguments as patterns */
+    int npatterns = argc - optind;
+    if (npatterns > MAX_PATTERNS) {
+        fprintf(stderr, "cursor-barrier: too many patterns (max %d)\n", MAX_PATTERNS);
+        return 1;
+    }
+    const char *patterns[MAX_PATTERNS];
+    char pats[MAX_PATTERNS][256];  /* lowercase versions */
+    for (int i = 0; i < npatterns; i++) {
+        patterns[i] = argv[optind + i];
+        memset(pats[i], 0, sizeof(pats[i]));
+        for (size_t k = 0; k < strlen(patterns[i]) && k < sizeof(pats[i]) - 1; k++)
+            pats[i][k] = tolower(patterns[i][k]);
+    }
 
     const char *his = getenv("HYPRLAND_INSTANCE_SIGNATURE");
     const char *xrd = getenv("XDG_RUNTIME_DIR");
@@ -375,32 +400,40 @@ int main(int argc, char **argv) {
     }
 
     enum state state    = STATE_IDLE;
-    int target_focused  = 0;
+    int matched_idx     = -1;   /* index into pats[] of currently focused pattern, or -1 */
     int cursor_x        = boundary_x >= 0 ? boundary_x + 500 : 9999;
     int buttons_held    = 0;
-    int boundary_known  = (boundary_x >= 0);
     char resp[4096], evbuf[4096];
+
+    /* Print startup banner */
+    if (boundary_explicit && boundary_x >= 0) {
+        if (npatterns == 1)
+            fprintf(stderr, "cursor-barrier: watching for '%s', boundary x=%d, buffer=%dpx\n",
+                    patterns[0], boundary_x, buffer);
+        else
+            fprintf(stderr, "cursor-barrier: watching for %d patterns, boundary x=%d, buffer=%dpx\n",
+                    npatterns, boundary_x, buffer);
+    } else {
+        if (npatterns == 1)
+            fprintf(stderr, "cursor-barrier: watching for '%s' (boundary will be auto-detected on first focus)\n",
+                    patterns[0]);
+        else
+            fprintf(stderr, "cursor-barrier: watching for %d patterns (boundary will be auto-detected on first focus)\n",
+                    npatterns);
+    }
 
     /* Check initial state */
     if (hypr_cmd(socket_dir, "activewindow", resp, sizeof(resp)) > 0) {
-        target_focused = contains_lower(resp, pat);
-        if (target_focused) {
-            if (!boundary_known) {
-                boundary_x = autodetect_boundary(socket_dir, pat);
-                if (boundary_x >= 0) boundary_known = 1;
+        matched_idx = match_pattern_idx(resp, pats, npatterns);
+        if (matched_idx >= 0) {
+            if (!boundary_explicit) {
+                boundary_x = autodetect_boundary(socket_dir, pats[matched_idx]);
             }
             cursor_x = get_cursor_x(socket_dir);
-            if (cursor_x < 0) cursor_x = boundary_x + 500;
+            if (cursor_x < 0) cursor_x = boundary_x >= 0 ? boundary_x + 500 : 9999;
             state = STATE_WATCHING;
         }
     }
-
-    if (boundary_known)
-        fprintf(stderr, "cursor-barrier: watching for '%s', boundary x=%d, buffer=%dpx\n",
-                pattern, boundary_x, buffer);
-    else
-        fprintf(stderr, "cursor-barrier: watching for '%s' (boundary will be auto-detected on first focus)\n",
-                pattern);
 
     while (running) {
         int timeout;
@@ -430,25 +463,32 @@ int main(int argc, char **argv) {
             while (line && *line) {
                 char *nl = strchr(line, '\n');
                 if (nl) *nl = '\0';
-                if (strncmp(line, "activewindow>>", 14) == 0)
-                    target_focused = contains_lower(line + 14, pat);
+                if (strncmp(line, "activewindow>>", 14) == 0) {
+                    int prev_idx = matched_idx;
+                    matched_idx = match_pattern_idx(line + 14, pats, npatterns);
+                    /* Re-detect boundary when the focused pattern changes and no
+                     * explicit boundary was given — different patterns may be on
+                     * different monitors. */
+                    if (!boundary_explicit && matched_idx >= 0
+                            && matched_idx != prev_idx) {
+                        boundary_x = autodetect_boundary(socket_dir, pats[matched_idx]);
+                    }
+                }
                 if (nl) line = nl + 1; else break;
             }
         }
 
         /* ── State transitions ── */
-        if (!target_focused && state != STATE_IDLE) {
+        if (matched_idx < 0 && state != STATE_IDLE) {
             if (state == STATE_GUARDING) ungrab_mice(mice, nmice);
             state = STATE_IDLE;
         }
-        else if (target_focused && state == STATE_IDLE) {
-            /* Auto-detect boundary on first focus if not yet known */
-            if (!boundary_known) {
-                boundary_x = autodetect_boundary(socket_dir, pat);
-                if (boundary_x >= 0) {
-                    boundary_known = 1;
+        else if (matched_idx >= 0 && state == STATE_IDLE) {
+            /* Auto-detect boundary on focus if not explicitly set */
+            if (!boundary_explicit) {
+                boundary_x = autodetect_boundary(socket_dir, pats[matched_idx]);
+                if (boundary_x >= 0)
                     fprintf(stderr, "cursor-barrier: boundary x=%d (auto-detected)\n", boundary_x);
-                }
             }
             cursor_x = get_cursor_x(socket_dir);
             if (cursor_x < 0) cursor_x = boundary_x >= 0 ? boundary_x + 500 : 9999;
@@ -471,7 +511,7 @@ int main(int argc, char **argv) {
                 }
             }
 
-            if (boundary_known) {
+            if (boundary_x >= 0) {
                 cursor_x = get_cursor_x(socket_dir);
                 /* Grab only when near boundary AND no buttons held */
                 if (cursor_x >= 0 && cursor_x < boundary_x + buffer && buttons_held == 0) {
