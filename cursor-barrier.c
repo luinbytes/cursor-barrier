@@ -521,8 +521,11 @@ int main(int argc, char **argv) {
                 sync_ctr = 0;
             }
 
-            /* Return to WATCHING once cursor is safely away from the edge */
-            if (cursor_x > boundary_x + buffer + GRAB_EXIT_EXTRA) {
+            /* Return to WATCHING once cursor is safely away from the edge.
+             * Only ungrab when no buttons are held — ungrabbing while a button
+             * is pressed causes the game to see the press on the virtual device
+             * but the release on the real device, which sticks buttons down. */
+            if (cursor_x > boundary_x + buffer + GRAB_EXIT_EXTRA && buttons_held == 0) {
                 ungrab_mice(mice, nmice);
                 state = STATE_WATCHING;
             }
