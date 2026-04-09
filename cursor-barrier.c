@@ -194,57 +194,55 @@ static int get_monitor_boundary(const char *socket_dir, const char *monitor_name
 }
 
 /*
- * Find the left boundary X of the monitor containing the focused window
- * matching the given pattern.
+ * Get the left boundary X of the monitor containing the currently active window.
+ * Uses j/activewindow (monitor ID) + j/monitors (ID → x).
+ * This is reliable regardless of whether the pattern matched via class or title.
  */
-static int autodetect_boundary(const char *socket_dir, const char *pat) {
+static int get_active_window_boundary(const char *socket_dir) {
     char resp[4096];
-    if (hypr_cmd(socket_dir, "j/clients", resp, sizeof(resp)) <= 0) return -1;
+    if (hypr_cmd(socket_dir, "j/activewindow", resp, sizeof(resp)) <= 0) return -1;
 
-    /* Find the class matching our pattern */
-    char *p = resp;
-    while ((p = strstr(p, "\"class\":\"")) != NULL) {
-        p += 9;
-        char *end = strchr(p, '"');
-        if (!end) break;
-        char cls[256] = {0};
-        size_t len = end - p < (int)sizeof(cls) - 1 ? end - p : sizeof(cls) - 1;
-        memcpy(cls, p, len);
+    /* Extract integer monitor ID: "monitor": N */
+    char *mp = strstr(resp, "\"monitor\":");
+    if (!mp) return -1;
+    mp += 10;
+    while (*mp == ' ' || *mp == '\t') mp++;
+    if (!isdigit((unsigned char)*mp) && *mp != '-') return -1;
+    int monitor_id = atoi(mp);
 
-        /* Lowercase compare */
-        int match = 1;
-        size_t plen = strlen(pat);
-        if (len < plen) { match = 0; }
-        else {
-            match = 0;
-            for (size_t i = 0; i <= len - plen && !match; i++) {
-                size_t j;
-                for (j = 0; j < plen; j++)
-                    if (tolower(cls[i + j]) != pat[j]) break;
-                if (j == plen) match = 1;
-            }
-        }
+    /* Look up that monitor's x in j/monitors by matching "id": N */
+    char mresp[4096];
+    if (hypr_cmd(socket_dir, "j/monitors", mresp, sizeof(mresp)) <= 0) return -1;
 
-        if (match) {
-            /* Find the monitor name for this client — look for "monitor":"NAME" */
-            char *mp = strstr(end, "\"monitor\":\"");
-            if (!mp) break;
-            mp += 11;
-            char *mend = strchr(mp, '"');
-            if (!mend) break;
+    char search[64];
+    snprintf(search, sizeof(search), "\"id\": %d", monitor_id);
+    char *p = strstr(mresp, search);
+    if (!p) return -1;
+
+    /* Within the next 512 chars find "x": N */
+    char *end = p + 512 < mresp + sizeof(mresp) ? p + 512 : mresp + sizeof(mresp);
+    char saved = *end; *end = '\0';
+    char *xp = strstr(p, "\"x\":");
+    *end = saved;
+    if (!xp) return -1;
+
+    int bx = atoi(xp + 4);
+
+    /* Log the detected monitor name for debugging */
+    char *np = strstr(p, "\"name\":\"");
+    if (np) {
+        np += 8;
+        char *nend = strchr(np, '"');
+        if (nend) {
             char monitor_name[128] = {0};
-            size_t mlen = mend - mp < (int)sizeof(monitor_name) - 1
-                          ? mend - mp : sizeof(monitor_name) - 1;
-            memcpy(monitor_name, mp, mlen);
-            int bx = get_monitor_boundary(socket_dir, monitor_name);
-            if (bx >= 0)
-                fprintf(stderr, "cursor-barrier: auto-detected monitor %s, boundary x=%d\n",
-                        monitor_name, bx);
-            return bx;
+            size_t nlen = (size_t)(nend - np) < sizeof(monitor_name) - 1
+                          ? (size_t)(nend - np) : sizeof(monitor_name) - 1;
+            memcpy(monitor_name, np, nlen);
+            fprintf(stderr, "cursor-barrier: auto-detected monitor %s (id=%d), boundary x=%d\n",
+                    monitor_name, monitor_id, bx);
         }
-        p = end;
     }
-    return -1;
+    return bx;
 }
 
 /* ── Helpers ── */
@@ -427,7 +425,7 @@ int main(int argc, char **argv) {
         matched_idx = match_pattern_idx(resp, pats, npatterns);
         if (matched_idx >= 0) {
             if (!boundary_explicit) {
-                boundary_x = autodetect_boundary(socket_dir, pats[matched_idx]);
+                boundary_x = get_active_window_boundary(socket_dir);
             }
             cursor_x = get_cursor_x(socket_dir);
             if (cursor_x < 0) cursor_x = boundary_x >= 0 ? boundary_x + 500 : 9999;
@@ -471,7 +469,7 @@ int main(int argc, char **argv) {
                      * different monitors. */
                     if (!boundary_explicit && matched_idx >= 0
                             && matched_idx != prev_idx) {
-                        boundary_x = autodetect_boundary(socket_dir, pats[matched_idx]);
+                        boundary_x = get_active_window_boundary(socket_dir);
                     }
                 }
                 if (nl) line = nl + 1; else break;
@@ -486,9 +484,7 @@ int main(int argc, char **argv) {
         else if (matched_idx >= 0 && state == STATE_IDLE) {
             /* Auto-detect boundary on focus if not explicitly set */
             if (!boundary_explicit) {
-                boundary_x = autodetect_boundary(socket_dir, pats[matched_idx]);
-                if (boundary_x >= 0)
-                    fprintf(stderr, "cursor-barrier: boundary x=%d (auto-detected)\n", boundary_x);
+                boundary_x = get_active_window_boundary(socket_dir);
             }
             cursor_x = get_cursor_x(socket_dir);
             if (cursor_x < 0) cursor_x = boundary_x >= 0 ? boundary_x + 500 : 9999;
