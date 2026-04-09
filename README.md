@@ -79,17 +79,21 @@ Or install to your home directory (no sudo required):
 make install PREFIX=~/.local
 ```
 
+This installs the `cursor-barrier` daemon, the `cbgames` CLI, and the `cursor-barrier-gui` GTK app. The `.desktop` file is also installed so the GUI appears in your app launcher.
+
 ---
 
 ## Usage
 
+### Daemon
+
 ```
-cursor-barrier [OPTIONS] PATTERN
+cursor-barrier [OPTIONS] PATTERN [PATTERN...]
 ```
 
-`PATTERN` is a case-insensitive substring matched against the focused window's class and title, as reported by Hyprland. When a window matching the pattern is focused, confinement activates. When you alt-tab or focus something else, it deactivates instantly.
+`PATTERN` is a case-insensitive substring matched against the focused window's class and title, as reported by Hyprland. When a window matching any pattern is focused, confinement activates. When you alt-tab or focus something else, it deactivates instantly.
 
-### Options
+#### Options
 
 | Flag | Description |
 |---|---|
@@ -100,11 +104,14 @@ cursor-barrier [OPTIONS] PATTERN
 
 If neither `--monitor` nor `--boundary` is given, the boundary is auto-detected from whichever monitor the matched window is currently on.
 
-### Examples
+#### Examples
 
 ```bash
 # Auto-detect monitor from wherever War Thunder is running
 cursor-barrier "war thunder"
+
+# Multiple games in one daemon instance
+cursor-barrier "war thunder" "call of duty"
 
 # Explicitly confine to DP-1
 cursor-barrier --monitor DP-1 "war thunder"
@@ -112,31 +119,67 @@ cursor-barrier --monitor DP-1 "war thunder"
 # Confine Minecraft to HDMI-A-1 with a larger buffer zone
 cursor-barrier --monitor HDMI-A-1 --buffer 500 "minecraft"
 
-# Any game whose title contains "steam_app"
-cursor-barrier --monitor DP-1 "steam_app"
-
 # Hard-code the boundary at X=1920 (right edge of a 1920px-wide left monitor)
 cursor-barrier --boundary 1920 "war thunder"
 ```
 
-### Finding your monitor name
+#### Finding your monitor name
 
 ```bash
 hyprctl monitors | grep "Monitor "
 ```
 
-### Autostart with Hyprland
+#### Autostart with Hyprland
 
 Add to `~/.config/hypr/autostart.conf`:
 
 ```
-exec-once = cursor-barrier --monitor DP-1 "war thunder"
+exec-once = cursor-barrier "war thunder" "call of duty"
 ```
 
 If you're using UWSM session management:
 ```
-exec-once = uwsm-app -- cursor-barrier --monitor DP-1 "war thunder"
+exec-once = uwsm-app -- cursor-barrier "war thunder" "call of duty"
 ```
+
+---
+
+### cbgames — CLI game list manager
+
+`cbgames` manages the game list in your Hyprland autostart config and restarts the daemon automatically.
+
+```bash
+cbgames list               # show all games currently in the list
+cbgames add "elden ring"   # add a game and restart the daemon
+cbgames remove "halfsword" # remove a game and restart the daemon
+cbgames restart            # restart the daemon without changing the list
+```
+
+`add` and `remove` are case-insensitive and update `~/.config/hypr/autostart.conf` in place.
+
+---
+
+### cursor-barrier-gui — GTK4 GUI
+
+A graphical interface for managing the game list, built with GTK4 and libadwaita.
+
+Launch it from your app menu ("Cursor Barrier") or run `cursor-barrier-gui`.
+
+**Features:**
+- Lists all configured games with a remove button per entry
+- Add dialog with a **window picker** — click the eyedropper, then click any window to detect its class name automatically (uses the Hyprland event socket)
+- Changes take effect immediately — the daemon is restarted on every add/remove
+
+**Requirements:** Python 3, GTK4, libadwaita (`python-gobject` on Arch).
+
+**Floating window rule (Hyprland):** Add to your `hyprland.conf` to keep the GUI floating:
+```
+windowrule = float = true, match:class lu.cursorbarrier
+```
+
+---
+
+> **Note on games that use raw input:** Some games handle mouse input correctly regardless of cursor position (raw input / pointer lock), meaning cursor-barrier isn't needed for them. If you notice that confinement is *causing* issues (e.g. blocking in-game mouse movement at the screen edge), remove that game from the list — it doesn't need it.
 
 ---
 
