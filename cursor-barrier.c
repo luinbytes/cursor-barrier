@@ -437,8 +437,8 @@ int main(int argc, char **argv) {
         int timeout;
         switch (state) {
             case STATE_IDLE:     timeout = -1; break;
-            case STATE_WATCHING: timeout = 30; break;
-            case STATE_GUARDING: timeout = 1;  break;
+            case STATE_WATCHING: timeout = 500; break;
+            case STATE_GUARDING: timeout = 100; break;
             default:             timeout = 30; break;
         }
 
@@ -491,9 +491,23 @@ int main(int argc, char **argv) {
             state = STATE_WATCHING;
         }
 
+        /* ── IDLE: drain mouse events so poll doesn't spin ── */
+        if (state == STATE_IDLE) {
+            for (int p = 1; p < npfds; p++) {
+                if (!(pfds[p].revents & POLLIN)) continue;
+                int mi = pfd_mouse[p];
+                struct input_event ev;
+                while (libevdev_next_event(mice[mi].dev,
+                        LIBEVDEV_READ_FLAG_NORMAL, &ev) == LIBEVDEV_READ_STATUS_SUCCESS)
+                    ; /* discard */
+            }
+        }
+
         /* ── WATCHING ── */
         if (state == STATE_WATCHING) {
-            /* Read mouse events without grabbing — track button state only */
+            /* Read mouse events without grabbing — track button state and
+             * check cursor position only when the mouse actually moved. */
+            int mouse_moved = 0;
             for (int p = 1; p < npfds; p++) {
                 if (!(pfds[p].revents & POLLIN)) continue;
                 int mi = pfd_mouse[p];
@@ -504,10 +518,12 @@ int main(int argc, char **argv) {
                         if (ev.value == 1) buttons_held++;
                         else if (ev.value == 0 && buttons_held > 0) buttons_held--;
                     }
+                    if (ev.type == EV_REL)
+                        mouse_moved = 1;
                 }
             }
 
-            if (boundary_x >= 0) {
+            if (mouse_moved && boundary_x >= 0) {
                 cursor_x = get_cursor_x(socket_dir);
                 /* Grab only when near boundary AND no buttons held */
                 if (cursor_x >= 0 && cursor_x < boundary_x + buffer && buttons_held == 0) {
@@ -549,12 +565,11 @@ int main(int argc, char **argv) {
                 }
             }
 
-            /* Sync cursor_x from Hyprland periodically to correct drift */
-            static int sync_ctr = 0;
-            if (++sync_ctr >= 50) {
+            /* Sync cursor_x from Hyprland periodically to correct drift.
+             * With the 100ms poll timeout this runs ~10 times/sec. */
+            {
                 int real_x = get_cursor_x(socket_dir);
                 if (real_x >= 0) cursor_x = real_x;
-                sync_ctr = 0;
             }
 
             /* Return to WATCHING once cursor is safely away from the edge.
