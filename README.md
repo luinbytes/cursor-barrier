@@ -77,7 +77,7 @@ Installs the `cursor-barrier` daemon, `cbgames` CLI, `cursor-barrier-gui` GTK ap
 cursor-barrier [OPTIONS] PATTERN [PATTERN...]
 ```
 
-Patterns are matched case-insensitively against the focused window's class/title. Confinement activates on match, deactivates instantly on alt-tab.
+Patterns are matched case-insensitively against the focused window's class. Confinement activates on match, deactivates instantly on alt-tab.
 
 **Options**
 

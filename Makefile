@@ -6,7 +6,7 @@ PREFIX  = /usr/local
 TARGET  = cursor-barrier
 SRC     = cursor-barrier.c
 
-.PHONY: all clean install uninstall
+.PHONY: all clean install uninstall test
 
 all: $(TARGET)
 
@@ -21,3 +21,8 @@ uninstall:
 
 clean:
 	rm -f $(TARGET)
+
+test:
+	$(CC) -Wall -Wextra -o test_match tests/test_match.c $(shell pkg-config --cflags --libs libevdev)
+	./test_match
+	rm -f test_match

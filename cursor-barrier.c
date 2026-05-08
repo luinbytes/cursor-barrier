@@ -260,13 +260,35 @@ static int contains_lower(const char *haystack, const char *needle) {
 }
 
 /*
- * Returns the index of the first pattern in pats[0..npatterns) that matches
- * haystack, or -1 if none match.
+ * Returns the index of the first pattern in pats[0..npatterns) that matches the
+ * Hyprland active window class, or -1 if none match. Hyprland events arrive as
+ * "class,title"; the command response is a multiline block with a "class:" row.
  */
 static int match_pattern_idx(const char *haystack,
                               const char pats[][256], int npatterns) {
+    char class_name[512] = {0};
+    const char *match_text = haystack;
+
+    const char *class_line = strstr(haystack, "class:");
+    if (class_line) {
+        class_line += 6;
+        while (*class_line == ' ' || *class_line == '\t') class_line++;
+        size_t len = strcspn(class_line, "\r\n");
+        if (len >= sizeof(class_name)) len = sizeof(class_name) - 1;
+        memcpy(class_name, class_line, len);
+        match_text = class_name;
+    } else {
+        const char *comma = strchr(haystack, ',');
+        if (comma) {
+            size_t len = (size_t)(comma - haystack);
+            if (len >= sizeof(class_name)) len = sizeof(class_name) - 1;
+            memcpy(class_name, haystack, len);
+            match_text = class_name;
+        }
+    }
+
     for (int i = 0; i < npatterns; i++) {
-        if (contains_lower(haystack, pats[i]))
+        if (contains_lower(match_text, pats[i]))
             return i;
     }
     return -1;
